@@ -4,6 +4,7 @@
 //---------------------------------------------------------
 extern crate clap;
 use std::time::{Instant};
+use std::cmp;
 use hashbrown::{HashMap};
 use itertools::Itertools;
 use clap::{Arg, App, SubCommand, value_t};
@@ -135,15 +136,30 @@ pub fn get_ml_tag(record: &bam::Record) -> Result<Aux, rust_htslib::errors::Erro
     return r;
 }
 
+pub fn get_haplotype_tag(record: &bam::Record) -> Aux {
+    if let Ok(Aux::U8(hap_tag)) = record.aux(b"HP") {
+        return Aux::U8(hap_tag);
+    }
+    else {
+        return Aux::U8(0);
+    }
+}
+
 impl ReadModifications
 {
 
     pub fn from_bam_record(record: &bam::Record) -> Option<Self> {
         
         // records that are missing the SEQ field cannot be processed
-        if record.seq().len() == 0 {
+        if record.seq().len() == 0 || record.flags()&2048>0 {
             return None;
         }
+    
+
+
+       // if let Aux::U8(hap_tag) = get_haplotype_tag(record) {
+        //    println!("Parsed read with tag -> {} modifications\n",hap_tag);
+
 
         let mut rm = ReadModifications {
             canonical_base: 'x',
@@ -159,7 +175,7 @@ impl ReadModifications
             instrument_read_seq = alphabets::dna::revcomp(instrument_read_seq);
             rm.strand = '-';
         }
-
+        
         // do I need to nest these?
         if let Ok(Aux::String(mm_str)) = get_mm_tag(record) {
             if let Ok(Aux::ArrayU8(probability_array)) = get_ml_tag(record) {
@@ -343,56 +359,95 @@ fn calculate_reference_frequency(threshold: f64, collapse_strands: bool, input_b
     eprintln!("calculating modification frequency with t:{} on file {}", threshold, input_bam);
 
     let mut bam = bam::Reader::from_path(input_bam).expect("Could not read input bam file:");
+    bam.set_reference("/cluster/work/pausch/alex/REF_DATA/ARS-UCD1.2_Btau5.0.1Y.fa");
+    bam.set_threads(2);    
     let header = bam::Header::from_template(bam.header());
+    let header_view = bam::HeaderView::from_header(&header);
 
     // map from (tid, position, strand) -> (methylated_reads, total_reads)
-    let mut reference_modifications = HashMap::<(i32, usize, char), (usize, usize)>::new();
+    let mut reference_modifications = HashMap::<(i32, usize, char), (usize, usize,usize, usize,usize, usize)>::new();
 
     //
     let start = Instant::now();
     let mut reads_processed = 0;
+    let mut chromosome = -1;
+    println!("chromosome\tposition\tstrand\thap0_modified_reads\thap0_total_reads\thap0_modified_frequency\thap1_modified_reads\thap1_total_reads\thap1_modified_frequency\thap2_modified_reads\thap2_total_reads\thap2_modified_frequency");
     for r in bam.records() {
         let record = r.unwrap();
+        if record.tid() != chromosome {
+            output_frequencies(&header_view, &reference_modifications);
+            reference_modifications.clear();
+            chromosome = record.tid();
+        }
 
         if let Some(rm) = ReadModifications::from_bam_record(&record) {
-            
+            if let Aux::U8(haplotype_tag) = get_haplotype_tag(&record) {
+
             for call in rm.modification_calls {
                 if call.is_confident(threshold) && call.reference_index.is_some() {
                     let mut reference_position = call.reference_index.unwrap().clone();
                     let mut strand = rm.strand;
                     if collapse_strands && strand == '-' {
-                        reference_position -= 1; // TODO: this only works for CpG
+                        if reference_position > 0 {
+                          reference_position -= 1; // TODO: this only works for CpG
+                        }
                         strand = '+';
                     }
-                    let mut e = reference_modifications.entry( (record.tid(), reference_position, strand) ).or_insert( (0, 0) );
-                    (*e).0 += call.is_modified() as usize;
-                    (*e).1 += 1;
+                    let mut e = reference_modifications.entry( (record.tid(), reference_position, strand) ).or_insert( (0, 0, 0, 0, 0, 0) );
+                    match haplotype_tag {
+                    0 => {
+                        (*e).0 += call.is_modified() as usize;
+                        (*e).1 += 1;
+                    },
+                    1 => {
+                        (*e).2 += call.is_modified() as usize;
+                        (*e).3 += 1;
+                    },
+                    2 => {
+                        (*e).4 += call.is_modified() as usize;
+                        (*e).5 += 1;
+                    },
+                    _ => println!("Uknown ploidy"),
+                    }
                 }
             }
         }
-
+        }
         reads_processed += 1;
     }
 
+    output_frequencies(&header_view, &reference_modifications);
     //
     let mut sum_reads = 0;
     let mut sum_modified = 0;
 
+    /*
     let header_view = bam::HeaderView::from_header(&header);
-    println!("chromosome\tposition\tstrand\tmodified_reads\ttotal_reads\tmodified_frequency");
+    println!("chromosome\tposition\tstrand\thap0_modified_reads\thap0_total_reads\thap0_modified_frequency\thap1_modified_reads\thap1_total_reads\thap1_modified_frequency\thap2_modified_reads\thap2_total_reads\thap2_modified_frequency");
     for key in reference_modifications.keys().sorted() {
         let (tid, position, strand) = key;
         let contig = String::from_utf8_lossy(header_view.tid2name(*tid as u32));
-        let (modified_reads, total_reads) = reference_modifications.get( key ).unwrap();
-        println!("{}\t{}\t{}\t{}\t{}\t{:.3}", contig, position, strand, modified_reads, total_reads, *modified_reads as f64 / *total_reads as f64);
+        let (hap0_modified_reads, hap0_total_reads, hap1_modified_reads, hap1_total_reads, hap2_modified_reads, hap2_total_reads) = reference_modifications.get( key ).unwrap();
+        println!("{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{:.3}\t{}\t{}\t{:.3}", contig, position, strand, hap0_modified_reads, hap0_total_reads, *hap0_modified_reads as f64 / cmp::max(1 as usize,*hap0_total_reads) as f64,hap1_modified_reads, hap1_total_reads, *hap1_modified_reads as f64 / cmp::max(1 as usize,*hap1_total_reads) as f64,hap2_modified_reads, hap2_total_reads, *hap2_modified_reads as f64 / cmp::max(1 as usize,*hap2_total_reads) as f64);
     
-        sum_reads += total_reads;
-        sum_modified += modified_reads;
+        sum_reads += hap0_total_reads + hap1_total_reads + hap2_total_reads;
+        sum_modified += hap0_modified_reads + hap1_modified_reads + hap2_modified_reads;
     }
-    
+    */
     let mean_depth = sum_reads as f64 / reference_modifications.keys().len() as f64;
     let mean_frequency = sum_modified as f64 / sum_reads as f64;
     eprintln!("Processed {} reads in {:?}. Mean depth: {:.2} mean modification frequency: {:.2}", reads_processed, start.elapsed(), mean_depth, mean_frequency);
+}
+
+fn output_frequencies(header_view: &bam::HeaderView, reference_modifications: &HashMap::<(i32, usize, char), (usize, usize,usize, usize,usize, usize)>) {
+
+    for key in reference_modifications.keys().sorted() {
+        let (tid, position, strand) = key;
+        let contig = String::from_utf8_lossy(header_view.tid2name(*tid as u32));
+        let (hap0_modified_reads, hap0_total_reads, hap1_modified_reads, hap1_total_reads, hap2_modified_reads, hap2_total_reads) = reference_modifications.get( key ).unwrap();
+        println!("{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\t{}\t{:.3}\t{}\t{}\t{:.3}", contig, position, strand, hap0_modified_reads, hap0_total_reads, *hap0_modified_reads as f64 / cmp::max(1 as usize,*hap0_total_reads) as f64,hap1_modified_reads, hap1_total_reads, *hap1_modified_reads     as f64 / cmp::max(1 as usize,*hap1_total_reads) as f64,hap2_modified_reads, hap2_total_reads, *hap2_modified_reads as f64 / cmp::max(1 as usize,*hap2_total_reads) as f64);
+
+}
 }
 
 fn calculate_read_frequency(threshold: f64, input_bam: &str) {
